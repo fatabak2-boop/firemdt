@@ -1045,20 +1045,20 @@ var _station=null,selId=null,selAgency='ALL',selQ='';
 var EMV_JSON='https://data.emergency.vic.gov.au/Show?pageId=getIncidentJSON';
 var EMV_RSS='https://data.emergency.vic.gov.au/Show?pageId=getIncidentRSS';
 // Ordered list of CORS proxies - tried in sequence until one works
+// Use built-in Cloudflare proxy (deployed alongside app as _worker.js)
+var PROXY_URL = '/proxy';
+var WORKER_PROXY = 'https://firemdt-upgrade.fatabak2.workers.dev/proxy';
 var CORS_PROXIES=[
-  // Own Pages Function — deployed alongside the app, always works
-  function(){return fetch('/api?type=json').then(function(r){if(!r.ok)throw 0;return r.json();});},
-  // Fallbacks if running locally
-  function(url){return fetch('https://corsproxy.io/?url='+encodeURIComponent(url)).then(function(r){if(!r.ok)throw 0;return r.json();});},
-  function(url){return fetch('https://api.allorigins.win/get?url='+encodeURIComponent(url)).then(function(r){if(!r.ok)throw 0;return r.json();}).then(function(w){if(!w||!w.contents)throw 0;return JSON.parse(w.contents);});},
+  function(url){return fetch(WORKER_PROXY+'?url='+encodeURIComponent(url)).then(function(r){if(!r.ok)throw 0;return r.json();});},
   function(url){return fetch('https://api.codetabs.com/v1/proxy?quest='+encodeURIComponent(url)).then(function(r){if(!r.ok)throw 0;return r.json();});}
 ];
 var RSS_PROXIES=[
-  function(url){return fetch('https://api.allorigins.win/get?url='+encodeURIComponent(url)).then(function(r){if(!r.ok)throw 0;return r.json();}).then(function(w){if(!w||!w.contents)throw 0;return w.contents;});},
-  function(url){return fetch('https://api.codetabs.com/v1/proxy?quest='+encodeURIComponent(url)).then(function(r){if(!r.ok)throw 0;return r.text();});},
-  function(url){return fetch('https://corsproxy.io/?url='+encodeURIComponent(url)).then(function(r){if(!r.ok)throw 0;return r.text();});},
-  function(url){return fetch('https://thingproxy.freeboard.io/fetch/'+url).then(function(r){if(!r.ok)throw 0;return r.text();});}
+  function(url){return fetch(WORKER_PROXY+'?url='+encodeURIComponent(url)).then(function(r){if(!r.ok)throw 0;return r.text();});},
+  function(url){return fetch('https://api.codetabs.com/v1/proxy?quest='+encodeURIComponent(url)).then(function(r){if(!r.ok)throw 0;return r.text();});}
 ];
+function proxyFetchText(url){return RSS_PROXIES[0](url).catch(function(){return RSS_PROXIES[1](url);});}
+function proxyFetchJSON(url){return CORS_PROXIES[0](url).catch(function(){return CORS_PROXIES[1](url);});}function proxyFetchText(url){return RSS_PROXIES[0](url).catch(function(){return RSS_PROXIES[1](url);});}
+function proxyFetchJSON(url){return CORS_PROXIES[0](url).catch(function(){return CORS_PROXIES[1](url);});}
 var WX_LAT=-37.8136,WX_LNG=144.9631,WX_LOC='MELBOURNE VIC'; // updated when incident/station geocoded
 function WX_URL(){return 'https://api.open-meteo.com/v1/forecast?latitude='+WX_LAT+'&longitude='+WX_LNG+'&current=temperature_2m,wind_speed_10m,wind_direction_10m,relative_humidity_2m&forecast_days=1';}
 
@@ -2247,76 +2247,58 @@ function pollRSS(){
       var parser=new DOMParser(),xml=parser.parseFromString(txt,'text/xml');
       var items=xml.querySelectorAll('item'),nc=0;
       items.forEach(function(item){
-        // Get raw fields
         var title=(item.querySelector('title')||{}).textContent||'';
         var desc=(item.querySelector('description')||{}).textContent||'';
         var guid=(item.querySelector('guid')||{}).textContent||'';
-        var link=(item.querySelector('link')||{}).textContent||'';
-
-        // Generate stable ID from guid or title (NOT the URL)
-        var id='RSS-'+(guid||title).replace(/[^a-z0-9]/gi,'').substring(0,20)+(desc.length%999);
+        var id='RSS-'+guid.replace(/[^0-9]/g,'').slice(-8)||('RSS-'+Date.now()+Math.random());
         if(knownIds[id]) return;
 
-        // Parse title: "ADVICE - STRUCTURE FIRE - Stay Informed" or "Structure Fire - Suburb"
-        var titleUp=title.toUpperCase();
-        var typeMap=['STRUCTURE FIRE','GRASS FIRE','SCRUB FIRE','FOREST FIRE','BUILDING FIRE',
-          'FIRE ALARM','ROAD CRASH','HAZARDOUS MATERIAL','RESCUE','FLOOD','STORM','GAS LEAK','MEDICAL','OTHER'];
-        var typ='INCIDENT';
-        for(var t=0;t<typeMap.length;t++){
-          if(titleUp.indexOf(typeMap[t])>=0){
-            typ=typeMap[t]==='BUILDING FIRE'?'STRUCTURE FIRE':
-                typeMap[t]==='ROAD CRASH'?'MVA':
-                typeMap[t]==='HAZARDOUS MATERIAL'?'HAZMAT':typeMap[t];
-            break;
-          }
+        // Parse desc fields - format: <strong>Field:</strong> Value<br>
+        function getField(d, field){
+          var idx=d.indexOf(field+':');
+          if(idx<0) return '';
+          var start=d.indexOf('</strong>',idx);
+          if(start<0) return '';
+          start+=9; // after </strong>
+          var end=d.indexOf('<br>',start);
+          return d.substring(start,end>0?end:start+60).replace(/&amp;/g,'&').replace(/<[^>]*>/g,'').trim();
         }
 
-        // Extract address from description
-        var addr='Victoria';
-        var liIdx=desc.indexOf('Incident Location');
-        if(liIdx>=0){
-          var liColon=desc.indexOf(':',liIdx);
-          if(liColon>=0){
-            var liEnd=desc.indexOf('<',liColon);
-            addr=desc.substring(liColon+1,liEnd>0?liEnd:liColon+60).replace(/&amp;/g,'&').trim();
-          }
-        }
-        // Fallback: extract suburb from title
-        if(addr==='Victoria'){
-          var parts=title.split('-');
-          if(parts.length>=2){
-            var sub=parts[parts.length-1].trim();
-            if(sub.length>2 && sub.indexOf('http')<0) addr=sub+', Victoria';
-          }
-        }
+        var typ=(getField(desc,'Type')||'INCIDENT').toUpperCase();
+        var loc=getField(desc,'Location')||'';
+        var dist=getField(desc,'Fire District')||'Victoria';
+        var incNo=getField(desc,'Incident No')||'';
+        var lat=parseFloat(getField(desc,'Latitude'))||0;
+        var lng=parseFloat(getField(desc,'Longitude'))||0;
+        var vehicles=getField(desc,'Vehicles')||'TBA';
+        var agency=getField(desc,'Agency')||'';
+        var status=getField(desc,'Status')||'';
 
-        // Extract district
-        var dist='Victoria';
-        var cIdx=desc.indexOf('Council Area');
-        if(cIdx<0) cIdx=desc.indexOf('Council');
-        if(cIdx>=0){
-          var cColon=desc.indexOf(':',cIdx);
-          if(cColon>=0){
-            var cEnd=desc.indexOf('<',cColon);
-            dist=desc.substring(cColon+1,cEnd>0?cEnd:cColon+40).replace(/&amp;/g,'&').trim();
-          }
-        }
+        // Build address from title (SUBURB, STREET) + suburb
+        var addr=title;
+        if(loc&&title.indexOf(loc)<0) addr=title+', '+loc+', Victoria';
+        else addr=title+', Victoria';
 
-        // Generate a readable call ID
-        var callId='RSS-'+String(nc+incidents.length+1).padStart(4,'0');
+        // Map type to standard
+        var typeMap={'STRUCTURE':'STRUCTURE FIRE','GRASS':'GRASS FIRE','BUSHFIRE':'GRASS FIRE',
+          'SCRUB':'SCRUB FIRE','MVA':'MVA','HAZMAT':'HAZMAT','RESCUE':'RESCUE',
+          'FLOOD':'FLOOD','STORM':'STORM','MEDICAL':'MEDICAL','FIRE ALARM':'FIRE ALARM'};
+        for(var k in typeMap){if(typ.indexOf(k)>=0){typ=typeMap[k];break;}}
 
-        var isWarning=titleUp.indexOf('WARNING')>=0||titleUp.indexOf('EMERGENCY')>=0;
         var isFire=typ.indexOf('FIRE')>=0||typ==='STRUCTURE FIRE';
+        var callId='INC-'+incNo;
 
         var ni={
           id:id, callId:callId, type:typ, ctype:typ,
           addr:addr, dist:dist,
           chan:_station?_station.radio:'CH 1',
-          pri:isWarning?'P1':'P2',
-          priL:isWarning?'P1 — EMERGENCY':'P2 — ACTIVE',
+          pri:status==='Responding'?'P1':'P2',
+          priL:status==='Responding'?'P1 — RESPONDING':'P2 — ACTIVE',
           col:isFire?'var(--r)':'var(--a)',
           fip:'N/A', keyPeg:'—', alarmNo:'—',
-          caller:'VicEmergency RSS', units:'TBA',
+          caller:agency||'VicEmergency',
+          units:vehicles!=='0'?vehicles+' unit(s)':'TBA',
+          lat:lat, lng:lng,
           time:new Date(), live:true
         };
         knownIds[id]=true;
@@ -2325,13 +2307,9 @@ function pollRSS(){
         nc++;
         if(matchStn(ni)) trigAlert(ni);
       });
-      if(nc>0||incidents.length>0){
-        renderIncs();
-        if(nc>0) selInc(0);
-      }
+      if(nc>0||incidents.length>0){ renderIncs(); if(nc>0) selInc(0); }
       setSB('sb-vic','dg','RSS: '+items.length+' incidents');
       feed('📡 RSS: '+items.length+' incidents ('+nc+' new)');
-      var cnt=G('inc-count');if(cnt)cnt.textContent=incidents.length;
     }).catch(function(){return tryRSS(pidx+1);});
   }
   return tryRSS(0);
