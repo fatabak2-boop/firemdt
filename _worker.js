@@ -2,6 +2,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     
+    // Handle CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -11,6 +12,7 @@ export default {
       });
     }
     
+    // Only intercept /proxy route
     if (url.pathname === '/proxy') {
       const target = url.searchParams.get('url');
       if (!target) return new Response('Missing url', { status: 400 });
@@ -32,7 +34,11 @@ export default {
       }
     }
     
-    // Serve static assets
-    return env.ASSETS.fetch(request);
+    // All other requests - serve static assets
+    try {
+      return await env.ASSETS.fetch(request);
+    } catch(e) {
+      return new Response('Not found', { status: 404 });
+    }
   }
 };
